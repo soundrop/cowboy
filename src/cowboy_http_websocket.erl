@@ -460,12 +460,19 @@ handler_call(State=#state{handler=Handler, opts=Opts}, Req, HandlerState,
 			NextState(State#state{hibernate=true},
 				Req2, HandlerState2, RemainingData);
 		{reply, Payload, Req2, HandlerState2} ->
-			websocket_send(Payload, State, Req2),
-			NextState(State, Req2, HandlerState2, RemainingData);
+			case websocket_send(Payload, State, Req2) of
+				{error, Reason} ->
+					handler_terminate(State, Req2, HandlerState2, {error, Reason});
+				_ ->
+					NextState(State, Req2, HandlerState2, RemainingData)
+			end;
 		{reply, Payload, Req2, HandlerState2, hibernate} ->
-			websocket_send(Payload, State, Req2),
-			NextState(State#state{hibernate=true},
-				Req2, HandlerState2, RemainingData);
+			case websocket_send(Payload, State, Req2) of
+				{error, Reason} ->
+					handler_terminate(State, Req2, HandlerState2, {error, Reason});
+				_ ->
+					NextState(State#state{hibernate=true}, Req2, HandlerState2, RemainingData)
+			end;
 		{shutdown, Req2, HandlerState2} ->
 			websocket_close(State, Req2, HandlerState2, {normal, shutdown})
 	catch Class:Reason ->
@@ -480,7 +487,7 @@ handler_call(State=#state{handler=Handler, opts=Opts}, Req, HandlerState,
 		websocket_close(State, Req, HandlerState, {error, handler})
 	end.
 
--spec websocket_send(binary(), #state{}, #http_req{}) -> closed | ignore.
+-spec websocket_send(binary(), #state{}, #http_req{}) -> ok | {error, atom()} | ignore.
 %% hixie-76 text frame.
 websocket_send({text, Payload}, #state{version=0},
 		#http_req{socket=Socket, transport=Transport}) ->
