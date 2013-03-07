@@ -325,7 +325,8 @@ file_contents(Req, #state{filepath=Filepath,
 		case Transport:sendfile(Socket, Filepath) of
 			{ok, _} -> ok;
 			{error, closed} -> ok;
-			{error, enotconn} -> ok
+			{error, enotconn} -> ok;
+			{error, etimedout} -> ok
 		end
 	end,
 	{{stream, Filesize, Writefile}, Req, State}.
