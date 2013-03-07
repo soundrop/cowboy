@@ -197,7 +197,9 @@ parse_method(<< C, Rest/bits >>, State, SoFar) ->
 		$\r -> error_terminate(400, State);
 		$\s -> parse_uri(Rest, State, SoFar);
 		_ -> parse_method(Rest, State, << SoFar/binary, C >>)
-	end.
+	end;
+parse_method(_, State, _SoFar) ->
+	error_terminate(400, State).
 
 parse_uri(<< $\r, _/bits >>, State, _) ->
 	error_terminate(400, State);
@@ -224,7 +226,9 @@ parse_uri_path(<< C, Rest/bits >>, State, Method, SoFar) ->
 		$? -> parse_uri_query(Rest, State, Method, SoFar, <<>>);
 		$# -> parse_uri_fragment(Rest, State, Method, SoFar, <<>>, <<>>);
 		_ -> parse_uri_path(Rest, State, Method, << SoFar/binary, C >>)
-	end.
+	end;
+parse_uri_path(_, State, _Method, _SoFar) ->
+	error_terminate(400, State).
 
 parse_uri_query(<< C, Rest/bits >>, S, M, P, SoFar) ->
 	case C of
@@ -232,14 +236,18 @@ parse_uri_query(<< C, Rest/bits >>, S, M, P, SoFar) ->
 		$\s -> parse_version(Rest, S, M, P, SoFar, <<>>);
 		$# -> parse_uri_fragment(Rest, S, M, P, SoFar, <<>>);
 		_ -> parse_uri_query(Rest, S, M, P, << SoFar/binary, C >>)
-	end.
+	end;
+parse_uri_query(_, S, _, _, _) ->
+	error_terminate(400, S).
 
 parse_uri_fragment(<< C, Rest/bits >>, S, M, P, Q, SoFar) ->
 	case C of
 		$\r -> error_terminate(400, S);
 		$\s -> parse_version(Rest, S, M, P, Q, SoFar);
 		_ -> parse_uri_fragment(Rest, S, M, P, Q, << SoFar/binary, C >>)
-	end.
+	end;
+parse_uri_fragment(_, S, _, _, _, _) ->
+	error_terminate(400, S).
 
 parse_version(<< "HTTP/1.1\r\n", Rest/bits >>, S, M, P, Q, F) ->
 	parse_header(Rest, S, M, P, Q, F, {1, 1}, []);
