@@ -322,11 +322,12 @@ file_contents(Req, #state{filepath=Filepath,
 	Writefile = fun(Socket, Transport) ->
 		%% Transport:sendfile/2 may return {error, closed}
 		%% if the connection is closed while sending the file.
-		case Transport:sendfile(Socket, Filepath) of
+		try Transport:sendfile(Socket, Filepath) of
 			{ok, _} -> ok;
-			{error, closed} -> ok;
-			{error, enotconn} -> ok;
-			{error, etimedout} -> ok
+			{error, closed} -> ok
+		catch
+			error:{badmatch, {error, enotconn}} -> ok;
+			error:{badmatch, {error, etimedout}} -> ok
 		end
 	end,
 	{{stream, Filesize, Writefile}, Req, State}.
