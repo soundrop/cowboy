@@ -324,10 +324,10 @@ file_contents(Req, #state{filepath=Filepath,
 		%% if the connection is closed while sending the file.
 		try Transport:sendfile(Socket, Filepath) of
 			{ok, _} -> ok;
-			{error, closed} -> ok
+			{error, closed} -> ok;
+			{error, etimedout} -> ok
 		catch
-			error:{badmatch, {error, enotconn}} -> ok;
-			error:{badmatch, {error, etimedout}} -> ok
+			error:{badmatch, {error, enotconn}} -> ok
 		end
 	end,
 	{{stream, Filesize, Writefile}, Req, State}.
