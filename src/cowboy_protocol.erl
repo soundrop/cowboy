@@ -81,6 +81,8 @@
 	until :: non_neg_integer() | infinity
 }).
 
+-define(ACK_TIMEOUT, 30000).
+
 %% API.
 
 %% @doc Start an HTTP protocol process.
@@ -114,15 +116,20 @@ init(Ref, Socket, Transport, Opts) ->
 	OnRequest = get_value(onrequest, Opts, undefined),
 	OnResponse = get_value(onresponse, Opts, undefined),
 	Timeout = get_value(timeout, Opts, 5000),
-	ok = ranch:accept_ack(Ref),
-	wait_request(<<>>, #state{socket=Socket, transport=Transport,
-		middlewares=Middlewares, compress=Compress, env=Env,
-		max_empty_lines=MaxEmptyLines, max_keepalive=MaxKeepalive,
-		max_request_line_length=MaxRequestLineLength,
-		max_header_name_length=MaxHeaderNameLength,
-		max_header_value_length=MaxHeaderValueLength, max_headers=MaxHeaders,
-		onrequest=OnRequest, onresponse=OnResponse,
-		timeout=Timeout, until=until(Timeout)}, 0).
+	case ranch:accept_ack(Ref, ?ACK_TIMEOUT) of
+		ok ->
+			wait_request(<<>>, #state{socket=Socket, transport=Transport,
+				middlewares=Middlewares, compress=Compress, env=Env,
+				max_empty_lines=MaxEmptyLines, max_keepalive=MaxKeepalive,
+				max_request_line_length=MaxRequestLineLength,
+				max_header_name_length=MaxHeaderNameLength,
+				max_header_value_length=MaxHeaderValueLength, max_headers=MaxHeaders,
+				onrequest=OnRequest, onresponse=OnResponse,
+				timeout=Timeout, until=until(Timeout)}, 0);
+		{error, _Error} ->
+			Transport:close(Socket),
+			ok
+	end.
 
 
 -spec until(timeout()) -> non_neg_integer() | infinity.
