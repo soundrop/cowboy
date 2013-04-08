@@ -1029,29 +1029,25 @@ reply_may_compress(Status, Headers, Body, Req,
 				andalso (Encodings =/= undefined)
 				andalso (false =/= lists:keyfind(<<"gzip">>, 1, Encodings)),
 			case CanGzip of
-			     true ->
-				GzBody = zlib:gzip(Body),
-				{_, Req3} = response(Status, Headers, RespHeaders, [
-				      	      {<<"content-length">>, integer_to_list(byte_size(GzBody))},
-					      {<<"content-encoding">>, <<"gzip">>},
-					      {<<"date">>, cowboy_clock:rfc1123()},
-					      {<<"server">>, <<"Cowboy">>}
-					|HTTP11Headers],
-					case Method of <<"HEAD">> -> <<>>; _ -> GzBody end,
-					Req2),
-				Req3;
-			      false ->
-				reply_no_compress(Status, Headers, Body, Req,
-					RespHeaders, HTTP11Headers, Method, BodySize)
+				true ->
+					GzBody = zlib:gzip(Body),
+					{_, Req3} = response(Status, Headers, RespHeaders, [
+							{<<"content-length">>, integer_to_list(byte_size(GzBody))},
+							{<<"content-encoding">>, <<"gzip">>},
+							{<<"date">>, cowboy_clock:rfc1123()},
+							{<<"server">>, <<"Cowboy">>}
+						|HTTP11Headers],
+						case Method of <<"HEAD">> -> <<>>; _ -> GzBody end,
+						Req2),
+					Req3;
+				false ->
+					reply_no_compress(Status, Headers, Body, Req,
+						RespHeaders, HTTP11Headers, Method, BodySize)
 			end;
-	    {error, badarg} ->
-			error_logger:error_report([
-                               {message, "Failed to parse accept-encoding header"},
-                               {req, Req}
-			 ]),
+		{error, badarg} ->
 			reply_no_compress(Status, Headers, Body, Req,
 				RespHeaders, HTTP11Headers, Method, BodySize)
-        end.
+	end.
 
 reply_no_compress(Status, Headers, Body, Req,
 		RespHeaders, HTTP11Headers, Method, BodySize) ->
