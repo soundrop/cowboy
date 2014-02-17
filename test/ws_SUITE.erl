@@ -1,4 +1,4 @@
-%% Copyright (c) 2011-2013, Loïc Hoguin <essen@ninenines.eu>
+%% Copyright (c) 2011-2014, Loïc Hoguin <essen@ninenines.eu>
 %%
 %% Permission to use, copy, modify, and/or distribute this software for any
 %% purpose with or without fee is hereby granted, provided that the above
@@ -70,6 +70,7 @@ groups() ->
 
 init_per_suite(Config) ->
 	application:start(crypto),
+	application:start(cowlib),
 	application:start(ranch),
 	application:start(cowboy),
 	Config.
@@ -77,6 +78,7 @@ init_per_suite(Config) ->
 end_per_suite(_Config) ->
 	application:stop(cowboy),
 	application:stop(ranch),
+	application:stop(cowlib),
 	application:stop(crypto),
 	ok.
 

@@ -1,4 +1,4 @@
-%% Copyright (c) 2011-2013, Loïc Hoguin <essen@ninenines.eu>
+%% Copyright (c) 2011-2014, Loïc Hoguin <essen@ninenines.eu>
 %% Copyright (c) 2011, Anthony Ramine <nox@dev-extend.eu>
 %%
 %% Permission to use, copy, modify, and/or distribute this software for any
@@ -82,8 +82,11 @@
 -export([body/2]).
 -export([body_qs/1]).
 -export([body_qs/2]).
--export([multipart_data/1]).
--export([multipart_skip/1]).
+
+%% Multipart API.
+-export([part/1]).
+-export([part_body/1]).
+-export([part_body/2]).
 
 %% Response API.
 -export([set_resp_cookie/4]).
@@ -101,6 +104,7 @@
 -export([chunked_reply/3]).
 -export([chunk/2]).
 -export([upgrade_reply/3]).
+-export([maybe_reply/2]).
 -export([ensure_response/2]).
 
 %% Private setter/getter API.
@@ -114,10 +118,7 @@
 -export([lock/1]).
 -export([to_list/1]).
 
--type cookie_option() :: {max_age, non_neg_integer()}
-	| {domain, binary()} | {path, binary()}
-	| {secure, boolean()} | {http_only, boolean()}.
--type cookie_opts() :: [cookie_option()].
+-type cookie_opts() :: cow_cookie:cookie_opts().
 -export_type([cookie_opts/0]).
 
 -type content_decode_fun() :: fun((binary())
@@ -161,12 +162,13 @@
 	%% Request body.
 	body_state = waiting :: waiting | done | {stream, non_neg_integer(),
 		transfer_decode_fun(), any(), content_decode_fun()},
-	multipart = undefined :: undefined | {non_neg_integer(), fun()},
 	buffer = <<>> :: binary(),
+	multipart = undefined :: undefined | {binary(), binary()},
 
 	%% Response.
 	resp_compress = false :: boolean(),
-	resp_state = waiting :: locked | waiting | chunks | done,
+	resp_state = waiting :: locked | waiting | waiting_stream
+		| chunks | stream | done,
 	resp_headers = [] :: cowboy:http_headers(),
 	resp_body = <<>> :: iodata() | resp_body_fun()
 		| {non_neg_integer(), resp_body_fun()}
@@ -281,7 +283,7 @@ qs_val(Name, Req) when is_binary(Name) ->
 	-> {binary() | true | Default, Req} when Req::req(), Default::any().
 qs_val(Name, Req=#http_req{qs=RawQs, qs_vals=undefined}, Default)
 		when is_binary(Name) ->
-	QsVals = cowboy_http:x_www_form_urlencoded(RawQs),
+	QsVals = cow_qs:parse_qs(RawQs),
 	qs_val(Name, Req#http_req{qs_vals=QsVals}, Default);
 qs_val(Name, Req, Default) ->
 	case lists:keyfind(Name, 1, Req#http_req.qs_vals) of
@@ -292,7 +294,7 @@ qs_val(Name, Req, Default) ->
 %% @doc Return the full list of query string values.
 -spec qs_vals(Req) -> {list({binary(), binary() | true}), Req} when Req::req().
 qs_vals(Req=#http_req{qs=RawQs, qs_vals=undefined}) ->
-	QsVals = cowboy_http:x_www_form_urlencoded(RawQs),
+	QsVals = cow_qs:parse_qs(RawQs),
 	qs_vals(Req#http_req{qs_vals=QsVals});
 qs_vals(Req=#http_req{qs_vals=QsVals}) ->
 	{QsVals, Req}.
@@ -335,14 +337,14 @@ url(HostURL, Req=#http_req{path=Path, qs=QS}) ->
 	{<< HostURL/binary, Path/binary, QS2/binary >>, Req}.
 
 %% @equiv binding(Name, Req, undefined)
--spec binding(atom(), Req) -> {binary() | undefined, Req} when Req::req().
+-spec binding(atom(), Req) -> {any() | undefined, Req} when Req::req().
 binding(Name, Req) when is_atom(Name) ->
 	binding(Name, Req, undefined).
 
 %% @doc Return the binding value for the given key obtained when matching
 %% the host and path against the dispatch list, or a default if missing.
 -spec binding(atom(), Req, Default)
-	-> {binary() | Default, Req} when Req::req(), Default::any().
+	-> {any() | Default, Req} when Req::req(), Default::any().
 binding(Name, Req, Default) when is_atom(Name) ->
 	case lists:keyfind(Name, 1, Req#http_req.bindings) of
 		{Name, Value} -> {Value, Req};
@@ -350,7 +352,7 @@ binding(Name, Req, Default) when is_atom(Name) ->
 	end.
 
 %% @doc Return the full list of binding values.
--spec bindings(Req) -> {list({atom(), binary()}), Req} when Req::req().
+-spec bindings(Req) -> {[{atom(), any()}], Req} when Req::req().
 bindings(Req) ->
 	{Req#http_req.bindings, Req}.
 
@@ -429,7 +431,7 @@ parse_header(Name = <<"content-length">>, Req, Default) ->
 parse_header(Name = <<"content-type">>, Req, Default) ->
 	parse_header(Name, Req, Default, fun cowboy_http:content_type/1);
 parse_header(Name = <<"cookie">>, Req, Default) ->
-	parse_header(Name, Req, Default, fun cowboy_http:cookie_list/1);
+	parse_header(Name, Req, Default, fun cow_cookie:parse_cookie/1);
 parse_header(Name = <<"expect">>, Req, Default) ->
 	parse_header(Name, Req, Default,
 		fun (Value) ->
@@ -494,10 +496,7 @@ cookie(Name, Req=#http_req{cookies=undefined}, Default) when is_binary(Name) ->
 		{ok, undefined, Req2} ->
 			{Default, Req2#http_req{cookies=[]}};
 		{ok, Cookies, Req2} ->
-			cookie(Name, Req2#http_req{cookies=Cookies}, Default);
-		%% Flash player incorrectly sends an empty Cookie header.
-		{error, badarg} ->
-			{Default, Req#http_req{cookies=[]}}
+			cookie(Name, Req2#http_req{cookies=Cookies}, Default)
 	end;
 cookie(Name, Req, Default) ->
 	case lists:keyfind(Name, 1, Req#http_req.cookies) of
@@ -725,13 +724,6 @@ body(Req) ->
 %% @doc Return the body sent with the request.
 -spec body(non_neg_integer() | infinity, Req)
 	-> {ok, binary(), Req} | {error, atom()} when Req::req().
-body(infinity, Req) ->
-	case parse_header(<<"transfer-encoding">>, Req) of
-		{ok, [<<"identity">>], Req2} ->
-			read_body(Req2, <<>>);
-		{ok, _, _} ->
-			{error, chunked}
-	end;
 body(MaxBodyLength, Req) ->
 	case parse_header(<<"transfer-encoding">>, Req) of
 		{ok, [<<"identity">>], Req2} ->
@@ -781,65 +773,82 @@ body_qs(Req) ->
 body_qs(MaxBodyLength, Req) ->
 	case body(MaxBodyLength, Req) of
 		{ok, Body, Req2} ->
-			{ok, cowboy_http:x_www_form_urlencoded(Body), Req2};
+			{ok, cow_qs:parse_qs(Body), Req2};
 		{error, Reason} ->
 			{error, Reason}
 	end.
 
-%% Multipart Request API.
+%% Multipart API.
 
-%% @doc Return data from the multipart parser.
-%%
-%% Use this function for multipart streaming. For each part in the request,
-%% this function returns <em>{headers, Headers}</em> followed by a sequence of
-%% <em>{body, Data}</em> tuples and finally <em>end_of_part</em>. When there
-%% is no part to parse anymore, <em>eof</em> is returned.
--spec multipart_data(Req)
-	-> {headers, cowboy:http_headers(), Req} | {body, binary(), Req}
-		| {end_of_part | eof, Req} when Req::req().
-multipart_data(Req=#http_req{body_state=waiting}) ->
-	{ok, {<<"multipart">>, _SubType, Params}, Req2} =
-		parse_header(<<"content-type">>, Req),
+%% @doc Return the next part's headers.
+-spec part(Req)
+	-> {ok, cow_multipart:headers(), Req} | {done, Req}
+	when Req::req().
+part(Req=#http_req{multipart=undefined}) ->
+	part(init_multipart(Req));
+part(Req) ->
+	{ok, Data, Req2} = stream_multipart(Req),
+	part(Data, Req2).
+
+part(Buffer, Req=#http_req{multipart={Boundary, _}}) ->
+	case cow_multipart:parse_headers(Buffer, Boundary) of
+		more ->
+			{ok, Data, Req2} = stream_multipart(Req),
+			part(<< Buffer/binary, Data/binary >>, Req2);
+		{more, Buffer2} ->
+			{ok, Data, Req2} = stream_multipart(Req),
+			part(<< Buffer2/binary, Data/binary >>, Req2);
+		{ok, Headers, Rest} ->
+			{ok, Headers, Req#http_req{multipart={Boundary, Rest}}};
+		%% Ignore epilogue.
+		{done, _} ->
+			{done, Req#http_req{multipart=undefined}}
+	end.
+
+%% @doc Return the current part's body.
+-spec part_body(Req)
+	-> {ok, binary(), Req} | {more, binary(), Req}
+	when Req::req().
+part_body(Req) ->
+	part_body(8000000, Req).
+
+-spec part_body(non_neg_integer(), Req)
+	-> {ok, binary(), Req} | {more, binary(), Req}
+	when Req::req().
+part_body(MaxLength, Req=#http_req{multipart=undefined}) ->
+	part_body(MaxLength, init_multipart(Req));
+part_body(MaxLength, Req) ->
+	part_body(<<>>, MaxLength, Req, <<>>).
+
+part_body(Buffer, MaxLength, Req=#http_req{multipart={Boundary, _}}, Acc)
+		when byte_size(Acc) > MaxLength ->
+	{more, Acc, Req#http_req{multipart={Boundary, Buffer}}};
+part_body(Buffer, MaxLength, Req=#http_req{multipart={Boundary, _}}, Acc) ->
+	{ok, Data, Req2} = stream_multipart(Req),
+	case cow_multipart:parse_body(<< Buffer/binary, Data/binary >>, Boundary) of
+		{ok, Body} ->
+			part_body(<<>>, MaxLength, Req2, << Acc/binary, Body/binary >>);
+		{ok, Body, Rest} ->
+			part_body(Rest, MaxLength, Req2, << Acc/binary, Body/binary >>);
+		done ->
+			{ok, Acc, Req2};
+		{done, Body} ->
+			{ok, << Acc/binary, Body/binary >>, Req2};
+		{done, Body, Rest} ->
+			{ok, << Acc/binary, Body/binary >>,
+				Req2#http_req{multipart={Boundary, Rest}}}
+	end.
+
+init_multipart(Req) ->
+	{ok, {<<"multipart">>, _, Params}, Req2}
+		= parse_header(<<"content-type">>, Req),
 	{_, Boundary} = lists:keyfind(<<"boundary">>, 1, Params),
-	{ok, Length, Req3} = parse_header(<<"content-length">>, Req2),
-	multipart_data(Req3, Length, {more, cowboy_multipart:parser(Boundary)});
-multipart_data(Req=#http_req{multipart={Length, Cont}}) ->
-	multipart_data(Req, Length, Cont());
-multipart_data(Req=#http_req{body_state=done}) ->
-	{eof, Req}.
+	Req2#http_req{multipart={Boundary, <<>>}}.
 
-multipart_data(Req, Length, {headers, Headers, Cont}) ->
-	{headers, Headers, Req#http_req{multipart={Length, Cont}}};
-multipart_data(Req, Length, {body, Data, Cont}) ->
-	{body, Data, Req#http_req{multipart={Length, Cont}}};
-multipart_data(Req, Length, {end_of_part, Cont}) ->
-	{end_of_part, Req#http_req{multipart={Length, Cont}}};
-multipart_data(Req, 0, eof) ->
-	{eof, Req#http_req{body_state=done, multipart=undefined}};
-multipart_data(Req=#http_req{socket=Socket, transport=Transport},
-		Length, eof) ->
-	%% We just want to skip so no need to stream data here.
-	{ok, _Data} = Transport:recv(Socket, Length, 5000),
-	{eof, Req#http_req{body_state=done, multipart=undefined}};
-multipart_data(Req, Length, {more, Parser}) when Length > 0 ->
-	case stream_body(Req) of
-		{ok, << Data:Length/binary, Buffer/binary >>, Req2} ->
-			multipart_data(Req2#http_req{buffer=Buffer}, 0, Parser(Data));
-		{ok, Data, Req2} ->
-			multipart_data(Req2, Length - byte_size(Data), Parser(Data))
-	end.
-
-%% @doc Skip a part returned by the multipart parser.
-%%
-%% This function repeatedly calls <em>multipart_data/1</em> until
-%% <em>end_of_part</em> or <em>eof</em> is parsed.
--spec multipart_skip(Req) -> {ok, Req} when Req::req().
-multipart_skip(Req) ->
-	case multipart_data(Req) of
-		{end_of_part, Req2} -> {ok, Req2};
-		{eof, Req2} -> {ok, Req2};
-		{_, _, Req2} -> multipart_skip(Req2)
-	end.
+stream_multipart(Req=#http_req{multipart={_, <<>>}}) ->
+	stream_body(Req);
+stream_multipart(Req=#http_req{multipart={Boundary, Buffer}}) ->
+	{ok, Buffer, Req#http_req{multipart={Boundary, <<>>}}}.
 
 %% Response API.
 
@@ -853,7 +862,7 @@ multipart_skip(Req) ->
 -spec set_resp_cookie(iodata(), iodata(), cookie_opts(), Req)
 	-> Req when Req::req().
 set_resp_cookie(Name, Value, Opts, Req) ->
-	Cookie = cowboy_http:cookie_to_iodata(Name, Value, Opts),
+	Cookie = cow_cookie:setcookie(Name, Value, Opts),
 	set_resp_header(<<"set-cookie">>, Cookie, Req).
 
 %% @doc Add a header to the response.
@@ -951,7 +960,8 @@ reply(Status, Headers, Body, Req=#http_req{
 		socket=Socket, transport=Transport,
 		version=Version, connection=Connection,
 		method=Method, resp_compress=Compress,
-		resp_state=waiting, resp_headers=RespHeaders}) ->
+		resp_state=RespState, resp_headers=RespHeaders})
+		when RespState =:= waiting; RespState =:= waiting_stream ->
 	HTTP11Headers = if
 		Transport =/= cowboy_spdy, Version =:= 'HTTP/1.1' ->
 			[{<<"connection">>, atom_to_connection(Connection)}];
@@ -987,10 +997,12 @@ reply(Status, Headers, Body, Req=#http_req{
 			if	RespType =/= hook, Method =/= <<"HEAD">> ->
 					ChunkFun = fun(IoData) -> chunk(IoData, Req2) end,
 					BodyFun(ChunkFun),
-					%% Terminate the chunked body for HTTP/1.1 only.
-					case Version of
-						'HTTP/1.0' -> Req2;
-						_ -> last_chunk(Req2)
+					%% Send the last chunk if chunked encoding was used.
+					if
+						Version =:= 'HTTP/1.0'; RespState =:= waiting_stream ->
+							Req2;
+						true ->
+							last_chunk(Req2)
 					end;
 				true -> Req2
 			end;
@@ -1091,7 +1103,7 @@ chunk(Data, #http_req{socket=Socket, transport=cowboy_spdy,
 		resp_state=chunks}) ->
 	cowboy_spdy:stream_data(Socket, Data);
 chunk(Data, #http_req{socket=Socket, transport=Transport,
-		resp_state=chunks, version='HTTP/1.0'}) ->
+		resp_state=stream}) ->
 	Transport:send(Socket, Data);
 chunk(Data, #http_req{socket=Socket, transport=Transport,
 		resp_state=chunks}) ->
@@ -1120,6 +1132,19 @@ upgrade_reply(Status, Headers, Req=#http_req{transport=Transport,
 	], <<>>, Req),
 	{ok, Req2#http_req{resp_state=done, resp_headers=[], resp_body= <<>>}}.
 
+%% @doc Send a reply if one hasn't been sent already.
+%%
+%% Meant to be used internally for sending errors after crashes.
+%% @private
+-spec maybe_reply(cowboy:http_status(), req()) -> ok.
+maybe_reply(Status, Req) ->
+	receive
+		{cowboy_req, resp_sent} -> ok
+	after 0 ->
+		_ = cowboy_req:reply(Status, Req),
+		ok
+	end.
+
 %% @doc Ensure the response has been sent fully.
 %% @private
 -spec ensure_response(req(), cowboy:http_status()) -> ok.
@@ -1128,16 +1153,17 @@ ensure_response(#http_req{resp_state=done}, _) ->
 	ok;
 %% No response has been sent but everything apparently went fine.
 %% Reply with the status code found in the second argument.
-ensure_response(Req=#http_req{resp_state=waiting}, Status) ->
+ensure_response(Req=#http_req{resp_state=RespState}, Status)
+		when RespState =:= waiting; RespState =:= waiting_stream ->
 	_ = reply(Status, [], [], Req),
 	ok;
 %% Terminate the chunked body for HTTP/1.1 only.
-ensure_response(#http_req{method= <<"HEAD">>, resp_state=chunks}, _) ->
-	ok;
-ensure_response(#http_req{version='HTTP/1.0', resp_state=chunks}, _) ->
+ensure_response(#http_req{method= <<"HEAD">>}, _) ->
 	ok;
 ensure_response(Req=#http_req{resp_state=chunks}, _) ->
 	_ = last_chunk(Req),
+	ok;
+ensure_response(#http_req{}, _) ->
 	ok.
 
 %% Private setter/getter API.
@@ -1261,19 +1287,27 @@ chunked_response(Status, Headers, Req=#http_req{
 		resp_headers=[], resp_body= <<>>}};
 chunked_response(Status, Headers, Req=#http_req{
 		version=Version, connection=Connection,
-		resp_state=waiting, resp_headers=RespHeaders}) ->
+		resp_state=RespState, resp_headers=RespHeaders})
+		when RespState =:= waiting; RespState =:= waiting_stream ->
 	RespConn = response_connection(Headers, Connection),
-	HTTP11Headers = case Version of
-		'HTTP/1.1' -> [
-			{<<"connection">>, atom_to_connection(Connection)},
-			{<<"transfer-encoding">>, <<"chunked">>}];
-		_ -> []
+	HTTP11Headers = if
+		Version =:= 'HTTP/1.0' -> [];
+		true ->
+			MaybeTE = if
+				RespState =:= waiting_stream -> [];
+				true -> [{<<"transfer-encoding">>, <<"chunked">>}]
+			end,
+			[{<<"connection">>, atom_to_connection(Connection)}|MaybeTE]
+	end,
+	RespState2 = if
+		Version =:= 'HTTP/1.1', RespState =:= 'waiting' -> chunks;
+		true -> stream
 	end,
 	{RespType, Req2} = response(Status, Headers, RespHeaders, [
 		{<<"date">>, cowboy_clock:rfc1123()},
 		{<<"server">>, <<"Cowboy">>}
 	|HTTP11Headers], <<>>, Req),
-	{RespType, Req2#http_req{connection=RespConn, resp_state=chunks,
+	{RespType, Req2#http_req{connection=RespConn, resp_state=RespState2,
 			resp_headers=[], resp_body= <<>>}}.
 
 -spec response(cowboy:http_status(), cowboy:http_headers(),
@@ -1305,7 +1339,7 @@ response(Status, Headers, RespHeaders, DefaultHeaders, Body, Req=#http_req{
 			cowboy_spdy:reply(Socket, status(Status), FullHeaders, Body),
 			ReqPid ! {?MODULE, resp_sent},
 			normal;
-		waiting ->
+		RespState when RespState =:= waiting; RespState =:= waiting_stream ->
 			HTTPVer = atom_to_binary(Version, latin1),
 			StatusLine = << HTTPVer/binary, " ",
 				(status(Status))/binary, "\r\n" >>,
@@ -1353,7 +1387,7 @@ response_merge_headers(Headers, RespHeaders, DefaultHeaders) ->
 merge_headers(Headers, []) ->
 	Headers;
 merge_headers(Headers, [{<<"set-cookie">>, Value}|Tail]) ->
-  merge_headers([{<<"set-cookie">>, Value}|Headers], Tail);
+	merge_headers([{<<"set-cookie">>, Value}|Headers], Tail);
 merge_headers(Headers, [{Name, Value}|Tail]) ->
 	Headers2 = case lists:keymember(Name, 1, Headers) of
 		true -> Headers;

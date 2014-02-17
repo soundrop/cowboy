@@ -1,4 +1,4 @@
-%% Copyright (c) 2011-2013, Loïc Hoguin <essen@ninenines.eu>
+%% Copyright (c) 2011-2014, Loïc Hoguin <essen@ninenines.eu>
 %% Copyright (c) 2011, Anthony Ramine <nox@dev-extend.eu>
 %%
 %% Permission to use, copy, modify, and/or distribute this software for any
@@ -25,6 +25,10 @@
 -export([init_per_group/2]).
 -export([end_per_group/2]).
 
+%% Callbacks.
+-export([etag_gen/3]).
+-export([mimetypes_text_html/1]).
+
 %% Tests.
 -export([check_raw_status/1]).
 -export([check_status/1]).
@@ -43,7 +47,9 @@
 -export([http10_hostless/1]).
 -export([keepalive_max/1]).
 -export([keepalive_nl/1]).
+-export([keepalive_stream_loop/1]).
 -export([multipart/1]).
+-export([multipart_large/1]).
 -export([nc_rand/1]).
 -export([nc_zero/1]).
 -export([onrequest/1]).
@@ -51,6 +57,7 @@
 -export([onresponse_capitalize/1]).
 -export([onresponse_crash/1]).
 -export([onresponse_reply/1]).
+-export([parse_host/1]).
 -export([pipeline/1]).
 -export([pipeline_long_polling/1]).
 -export([rest_bad_accept/1]).
@@ -85,9 +92,12 @@
 -export([stream_body_set_resp_close/1]).
 -export([stream_body_set_resp_chunked/1]).
 -export([stream_body_set_resp_chunked10/1]).
+-export([streamed_response/1]).
 -export([te_chunked/1]).
 -export([te_chunked_chopped/1]).
 -export([te_chunked_delayed/1]).
+-export([te_chunked_split_body/1]).
+-export([te_chunked_split_crlf/1]).
 -export([te_identity/1]).
 
 %% ct.
@@ -101,6 +111,7 @@ all() ->
 		{group, onrequest},
 		{group, onresponse},
 		{group, onresponse_capitalize},
+		{group, parse_host},
 		{group, set_env}
 	].
 
@@ -123,7 +134,9 @@ groups() ->
 		http10_hostless,
 		keepalive_max,
 		keepalive_nl,
+		keepalive_stream_loop,
 		multipart,
+		multipart_large,
 		nc_rand,
 		nc_zero,
 		pipeline,
@@ -159,9 +172,12 @@ groups() ->
 		stream_body_set_resp_close,
 		stream_body_set_resp_chunked,
 		stream_body_set_resp_chunked10,
+		streamed_response,
 		te_chunked,
 		te_chunked_chopped,
 		te_chunked_delayed,
+		te_chunked_split_body,
+		te_chunked_split_crlf,
 		te_identity
 	],
 	[
@@ -180,6 +196,9 @@ groups() ->
 		{onresponse_capitalize, [parallel], [
 			onresponse_capitalize
 		]},
+		{parse_host, [], [
+			parse_host
+		]},
 		{set_env, [], [
 			set_env_dispatch
 		]}
@@ -187,6 +206,7 @@ groups() ->
 
 init_per_suite(Config) ->
 	application:start(crypto),
+	application:start(cowlib),
 	application:start(ranch),
 	application:start(cowboy),
 	Dir = ?config(priv_dir, Config) ++ "/static",
@@ -198,6 +218,7 @@ end_per_suite(Config) ->
 	ct_helper:delete_static_dir(Dir),
 	application:stop(cowboy),
 	application:stop(ranch),
+	application:stop(cowlib),
 	application:stop(crypto),
 	ok.
 
@@ -293,6 +314,22 @@ init_per_group(onresponse_capitalize, Config) ->
 	{ok, Client} = cowboy_client:init([]),
 	[{scheme, <<"http">>}, {port, Port}, {opts, []},
 		{transport, Transport}, {client, Client}|Config];
+init_per_group(parse_host, Config) ->
+	Transport = ranch_tcp,
+	Dispatch = cowboy_router:compile([
+		{'_', [
+			{"/req_attr", http_req_attr, []}
+		]}
+	]),
+	{ok, _} = cowboy:start_http(http, 100, [{port, 0}], [
+		{env, [{dispatch, Dispatch}]},
+		{max_keepalive, 50},
+		{timeout, 500}
+	]),
+	Port = ranch:get_port(http),
+	{ok, Client} = cowboy_client:init([]),
+	[{scheme, <<"http">>}, {port, Port}, {opts, []},
+		{transport, Transport}, {client, Client}|Config];
 init_per_group(set_env, Config) ->
 	Transport = ranch_tcp,
 	{ok, _} = cowboy:start_http(set_env, 100, [{port, 0}], [
@@ -321,6 +358,7 @@ init_dispatch(Config) ->
 	cowboy_router:compile([
 		{"localhost", [
 			{"/chunked_response", http_chunked, []},
+			{"/streamed_response", http_streamed, []},
 			{"/init_shutdown", http_init_shutdown, []},
 			{"/long_polling", http_long_polling, []},
 			{"/headers/dupe", http_handler,
@@ -342,24 +380,20 @@ init_dispatch(Config) ->
 					{reply, set_resp_chunked},
 					{body, [<<"stream_body">>, <<"_set_resp_chunked">>]}]},
 			{"/static/[...]", cowboy_static,
-				[{directory, ?config(static_dir, Config)},
-				 {mimetypes, [{<<".css">>, [<<"text/css">>]}]}]},
+				{dir, ?config(static_dir, Config)}},
 			{"/static_mimetypes_function/[...]", cowboy_static,
-				[{directory, ?config(static_dir, Config)},
-				 {mimetypes, {fun(Path, data) when is_binary(Path) ->
-					[<<"text/html">>] end, data}}]},
+				{dir, ?config(static_dir, Config),
+					[{mimetypes, ?MODULE, mimetypes_text_html}]}},
 			{"/handler_errors", http_errors, []},
 			{"/static_attribute_etag/[...]", cowboy_static,
-				[{directory, ?config(static_dir, Config)},
-				 {etag, {attributes, [filepath, filesize, inode, mtime]}}]},
+				{dir, ?config(static_dir, Config)}},
 			{"/static_function_etag/[...]", cowboy_static,
-				[{directory, ?config(static_dir, Config)},
-				 {etag, {fun static_function_etag/2, etag_data}}]},
-			{"/static_specify_file/[...]",  cowboy_static,
-				[{directory, ?config(static_dir, Config)},
-				 {mimetypes, [{<<".css">>, [<<"text/css">>]}]},
-				 {file, <<"style.css">>}]},
+				{dir, ?config(static_dir, Config),
+					[{etag, ?MODULE, etag_gen}]}},
+			{"/static_specify_file/[...]", cowboy_static,
+				{file, ?config(static_dir, Config) ++ "/style.css"}},
 			{"/multipart", http_multipart, []},
+			{"/multipart/large", http_multipart_stream, []},
 			{"/echo/body", http_echo_body, []},
 			{"/echo/body_qs", http_body_qs, []},
 			{"/param_all", rest_param_all, []},
@@ -378,10 +412,17 @@ init_dispatch(Config) ->
 			{"/rest_expires", rest_expires, []},
 			{"/rest_empty_resource", rest_empty_resource, []},
 			{"/loop_recv", http_loop_recv, []},
+			{"/loop_stream_recv", http_loop_stream_recv, []},
 			{"/loop_timeout", http_loop_timeout, []},
 			{"/", http_handler, []}
 		]}
 	]).
+
+etag_gen(_, _, _) ->
+	{strong, <<"etag">>}.
+
+mimetypes_text_html(_) ->
+	<<"text/html">>.
 
 %% Convenience functions.
 
@@ -497,7 +538,7 @@ check_status(Config) ->
 		{403, "/static/unreadable"},
 		{404, "/not/found"},
 		{404, "/static/not_found"},
-		{500, "/handler_errors?case=handler_before_reply"},
+		{500, "/handler_errors?case=handle_before_reply"},
 		{500, "/handler_errors?case=init_before_reply"},
 		{666, "/init_shutdown"}
 	],
@@ -690,14 +731,35 @@ keepalive_nl_loop(Client, URL, N) ->
 	ok = Transport:send(Socket, <<"\r\n">>), %% empty line
 	keepalive_nl_loop(Client3, URL, N - 1).
 
+keepalive_stream_loop(Config) ->
+	Client = ?config(client, Config),
+	Transport = ?config(transport, Config),
+	{ok, Client2} = cowboy_client:connect(
+		Transport, "localhost", ?config(port, Config), Client),
+	keepalive_stream_loop(Client2, 10).
+
+keepalive_stream_loop(Client, 0) ->
+	{error, closed} = cowboy_client:response(Client),
+	ok;
+keepalive_stream_loop(Client, N) ->
+	{ok, _} = cowboy_client:raw_request("POST /loop_stream_recv HTTP/1.1\r\n"
+		"Host: localhost\r\n"
+		"Connection: keepalive\r\n"
+		"Transfer-Encoding: chunked\r\n\r\n", Client),
+	_ = [{ok, _} = cowboy_client:raw_request(<<"4\r\n",Id:32,"\r\n">>, Client) ||
+		Id <- lists:seq(1, 250)],
+	{ok, _} = cowboy_client:raw_request(<<"0\r\n\r\n">>, Client),
+	{ok, 200, _, _} = cowboy_client:response(Client),
+	keepalive_stream_loop(Client, N-1).
+
 multipart(Config) ->
 	Client = ?config(client, Config),
 	Body = <<
 		"This is a preamble."
 		"\r\n--OHai\r\nX-Name:answer\r\n\r\n42"
 		"\r\n--OHai\r\nServer:Cowboy\r\n\r\nIt rocks!\r\n"
-		"\r\n--OHai--"
-		"This is an epiloque."
+		"\r\n--OHai--\r\n"
+		"This is an epilogue."
 	>>,
 	{ok, Client2} = cowboy_client:request(<<"POST">>,
 		build_url("/multipart", Config),
@@ -710,6 +772,21 @@ multipart(Config) ->
 		{[{<<"x-name">>, <<"answer">>}], <<"42">>},
 		{[{<<"server">>, <<"Cowboy">>}], <<"It rocks!\r\n">>}
 	].
+
+multipart_large(Config) ->
+	Client = ?config(client, Config),
+	Boundary = "----------",
+	Big = << 0:9000000/unit:8 >>,
+	Bigger = << 0:9999999/unit:8 >>,
+	Body = ["--", Boundary, "\r\ncontent-length: 9000000\r\n\r\n", Big, "\r\n",
+		"--", Boundary, "\r\ncontent-length: 9999999\r\n\r\n", Bigger, "\r\n",
+		"--", Boundary, "--\r\n"],
+	{ok, Client2} = cowboy_client:request(<<"POST">>,
+		build_url("/multipart/large", Config),
+		[{<<"content-type">>, ["multipart/x-large; boundary=", Boundary]}],
+		Body, Client),
+	{ok, 200, _, _} = cowboy_client:response(Client2),
+	ok.
 
 nc_reqs(Config, Input) ->
 	Cat = os:find_executable("cat"),
@@ -797,6 +874,29 @@ onresponse_hook(_, Headers, _, Req) ->
 	{ok, Req2} = cowboy_req:reply(
 		<<"777 Lucky">>, [{<<"x-hook">>, <<"onresponse">>}|Headers], Req),
 	Req2.
+
+parse_host(Config) ->
+	Tests = [
+		{<<"example.org\n8080">>, <<"example.org:8080">>},
+		{<<"example.org\n80">>, <<"example.org">>},
+		{<<"192.0.2.1\n8080">>, <<"192.0.2.1:8080">>},
+		{<<"192.0.2.1\n80">>, <<"192.0.2.1">>},
+		{<<"[2001:db8::1]\n8080">>, <<"[2001:db8::1]:8080">>},
+		{<<"[2001:db8::1]\n80">>, <<"[2001:db8::1]">>},
+		{<<"[::ffff:192.0.2.1]\n8080">>, <<"[::ffff:192.0.2.1]:8080">>},
+		{<<"[::ffff:192.0.2.1]\n80">>, <<"[::ffff:192.0.2.1]">>}
+	],
+	[begin
+		Client = ?config(client, Config),
+		{ok, Client2} = cowboy_client:request(<<"GET">>,
+			build_url("/req_attr?attr=host_and_port", Config),
+			[{<<"host">>, Host}],
+			Client),
+		{ok, 200, _, Client3} = cowboy_client:response(Client2),
+		{ok, Value, Client4} = cowboy_client:response_body(Client3),
+		{error, closed} = cowboy_client:response(Client4),
+        Value
+	end || {Value, Host} <- Tests].
 
 pipeline(Config) ->
 	Client = ?config(client, Config),
@@ -1125,16 +1225,6 @@ static_function_etag(Config) ->
 	false = ETag1 =:= undefined,
 	ETag1 = ETag2.
 
-%% Callback function for generating the ETag for the above test.
-static_function_etag(Arguments, etag_data) ->
-	{_, Filepath} = lists:keyfind(filepath, 1, Arguments),
-	{_, _Filesize} = lists:keyfind(filesize, 1, Arguments),
-	{_, _INode} = lists:keyfind(inode, 1, Arguments),
-	{_, _Modified} = lists:keyfind(mtime, 1, Arguments),
-	ChecksumCommand = lists:flatten(io_lib:format("sha1sum ~s", [Filepath])),
-	[Checksum|_] = string:tokens(os:cmd(ChecksumCommand), " "),
-	{strong, iolist_to_binary(Checksum)}.
-
 static_mimetypes_function(Config) ->
 	Client = ?config(client, Config),
 	{ok, Client2} = cowboy_client:request(<<"GET">>,
@@ -1240,6 +1330,17 @@ stream_body_set_resp_chunked10(Config) ->
 	end,
 	{error, closed} = Transport:recv(Socket, 0, 1000).
 
+streamed_response(Config) ->
+	Client = ?config(client, Config),
+	{ok, Client2} = cowboy_client:request(<<"GET">>,
+		build_url("/streamed_response", Config), Client),
+	{ok, 200, Headers, Client3} = cowboy_client:response(Client2),
+	false = lists:keymember(<<"transfer-encoding">>, 1, Headers),
+	{ok, Transport, Socket} = cowboy_client:transport(Client3),
+	{ok, <<"streamed_handler\r\nworks fine!">>}
+		= Transport:recv(Socket, 29, 1000),
+	{error, closed} = cowboy_client:response(Client3).
+
 te_chunked(Config) ->
 	Client = ?config(client, Config),
 	Body = list_to_binary(io_lib:format("~p", [lists:seq(1, 100)])),
@@ -1277,6 +1378,52 @@ te_chunked_delayed(Config) ->
 	_ = [begin
 		ok = Transport:send(Socket, Chunk),
 		ok = timer:sleep(10)
+	end || Chunk <- Chunks],
+	{ok, 200, _, Client3} = cowboy_client:response(Client2),
+	{ok, Body, _} = cowboy_client:response_body(Client3).
+
+te_chunked_split_body(Config) ->
+	Client = ?config(client, Config),
+	Body = list_to_binary(io_lib:format("~p", [lists:seq(1, 100)])),
+	Chunks = body_to_chunks(50, Body, []),
+	{ok, Client2} = cowboy_client:request(<<"GET">>,
+		build_url("/echo/body", Config),
+		[{<<"transfer-encoding">>, <<"chunked">>}], Client),
+	{ok, Transport, Socket} = cowboy_client:transport(Client2),
+	_ = [begin
+		case Chunk of
+			%% Final chunk.
+			<<"0\r\n\r\n">> ->
+				ok = Transport:send(Socket, Chunk);
+			_ ->
+				%% Chunk of form <<"9\r\nChunkBody\r\n">>.
+				[Size, ChunkBody, <<>>] =
+					binary:split(Chunk, [<<"\r\n">>], [global]),
+				PartASize = random:uniform(byte_size(ChunkBody)),
+				<<PartA:PartASize/binary, PartB/binary>> = ChunkBody,
+				ok = Transport:send(Socket, [Size, <<"\r\n">>, PartA]),
+				ok = timer:sleep(10),
+				ok = Transport:send(Socket, [PartB, <<"\r\n">>])
+		end
+	end || Chunk <- Chunks],
+	{ok, 200, _, Client3} = cowboy_client:response(Client2),
+	{ok, Body, _} = cowboy_client:response_body(Client3).
+
+te_chunked_split_crlf(Config) ->
+	Client = ?config(client, Config),
+	Body = list_to_binary(io_lib:format("~p", [lists:seq(1, 100)])),
+	Chunks = body_to_chunks(50, Body, []),
+	{ok, Client2} = cowboy_client:request(<<"GET">>,
+		build_url("/echo/body", Config),
+		[{<<"transfer-encoding">>, <<"chunked">>}], Client),
+	{ok, Transport, Socket} = cowboy_client:transport(Client2),
+	_ = [begin
+		%% <<"\r\n">> is last 2 bytes of Chunk split before or after <<"\r">>.
+		Len = byte_size(Chunk) - (random:uniform(2) - 1),
+		<<Chunk2:Len/binary, End/binary>> = Chunk,
+		ok = Transport:send(Socket, Chunk2),
+		ok = timer:sleep(10),
+		ok = Transport:send(Socket, End)
 	end || Chunk <- Chunks],
 	{ok, 200, _, Client3} = cowboy_client:response(Client2),
 	{ok, Body, _} = cowboy_client:response_body(Client3).
