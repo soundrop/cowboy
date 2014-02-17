@@ -202,11 +202,9 @@ match_eol(<< _, Rest/bits >>, N) ->
 match_eol(_, _) ->
 	nomatch.
 
-parse_method(<< C, _/bits >>, State, _SoFar)
-		when ?IS_CTL(C); ?IS_SEPARATOR(C) ->
-	error_terminate(400, State);
 parse_method(<< C, Rest/bits >>, State, SoFar) ->
 	case C of
+		$\r -> error_terminate(400, State);
 		$\s -> parse_uri(Rest, State, SoFar);
 		_ -> parse_method(Rest, State, << SoFar/binary, C >>)
 	end.
