@@ -11,7 +11,7 @@ PLT_APPS = crypto public_key ssl
 # Dependencies.
 
 DEPS = cowlib ranch
-dep_cowlib = https://github.com/soundrop/cowlib.git 214203308bf4642e2a57f9f67f2b98981da6d796
+dep_cowlib = https://github.com/soundrop/cowlib.git 6da8b14f09113ab2afb705cac5e6f388bd8705df
 dep_ranch = pkg://ranch 0.9.0
 
 TEST_DEPS = ct_helper gun
